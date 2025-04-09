@@ -6,6 +6,7 @@ import os
 import shutil
 from typing import Callable, List, Optional, Union
 import subprocess
+import time
 
 import numpy as np
 import torch
@@ -37,6 +38,159 @@ import tqdm
 import soundfile as sf
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+
+class LipsyncData:
+    def affine_transform_video(self, video_frames: np.ndarray, image_processor):
+        faces = []
+        boxes = []
+        affine_matrices = []
+        print(f"Affine transforming {len(video_frames)} faces...")
+        for frame in tqdm.tqdm(video_frames):
+            face, box, affine_matrix = image_processor.affine_transform(frame)
+            faces.append(face)
+            boxes.append(box)
+            affine_matrices.append(affine_matrix)
+
+        faces = torch.stack(faces)
+        return faces, boxes, affine_matrices
+
+    """
+    用于存储唇形同步过程中的数据
+
+    属性:
+        video_frames: 视频帧
+        faces: 检测到的人脸
+        boxes: 人脸边界框
+        affine_matrices: 仿射变换矩阵
+    """
+
+    def __init__(self, video_frames=None, image_processor=None):
+
+        faces, boxes, affine_matrices = self.affine_transform_video(
+            video_frames, image_processor
+        )
+        # 为平滑过渡，正向段删除最后一帧，逆向段删除最后一帧
+        # 为平滑过渡，删除最后一帧
+        self.video_frames = video_frames[:-1]
+        self.faces = faces[:-1]
+        self.boxes = boxes[:-1]
+        self.affine_matrices = affine_matrices[:-1]
+
+        self.flipped_video_frames = video_frames[::-1][:-1]
+        self.flipped_faces = faces.flip(0)[:-1]
+        self.flipped_boxes = boxes[::-1][:-1]
+        self.flipped_affine_matrices = affine_matrices[::-1][:-1]
+
+    """
+    根据起始值和窗口长度返回数据，目标数据获取的数据会大于video_frames的长度，为平滑过渡将video_frames和flipped_video_frames进行循环拼接
+    :param start: 起始值
+    :param size: 窗口长度
+    :return: 返回数据
+    """
+
+    def get_data(self, start, size):
+        """
+        获取指定范围的视频数据
+
+        参数:
+            start: 起始帧索引
+            size: 需要的帧数
+
+        返回:
+            tuple: (视频帧, 人脸, 边界框, 仿射矩阵)
+        """
+        total_frames = len(self.video_frames)
+
+        # 计算段落信息
+        start_segment = start // total_frames
+        end_segment = (start + size - 1) // total_frames  # 修正：使用size-1计算结束段
+
+        # 计算实际索引
+        start_idx = start % total_frames
+        end_idx = (
+            (start + size) % total_frames
+            if end_segment > start_segment
+            else start_idx + size
+        )
+
+        # 如果在同一段内
+        if start_segment == end_segment:
+            if start_segment % 2 == 0:
+                # 使用原始视频
+                return (
+                    self.video_frames[start_idx:end_idx],
+                    self.faces[start_idx:end_idx],
+                    self.boxes[start_idx:end_idx],
+                    self.affine_matrices[start_idx:end_idx],
+                )
+            else:
+                # 使用翻转视频
+                return (
+                    self.flipped_video_frames[start_idx:end_idx],
+                    self.flipped_faces[start_idx:end_idx],
+                    self.flipped_boxes[start_idx:end_idx],
+                    self.flipped_affine_matrices[start_idx:end_idx],
+                )
+
+        # 跨段处理
+        else:
+            # 计算第一段和第二段的数据
+            first_part_size = total_frames - start_idx
+            second_part_size = size - first_part_size
+
+            if start_segment % 2 == 0:
+                # 从原始视频到翻转视频
+                return (
+                    np.concatenate(
+                        [
+                            self.video_frames[start_idx:],
+                            self.flipped_video_frames[:second_part_size],
+                        ],
+                        axis=0,
+                    ),
+                    torch.cat(
+                        [self.faces[start_idx:], self.flipped_faces[:second_part_size]],
+                        dim=0,
+                    ),
+                    np.concatenate(
+                        [self.boxes[start_idx:], self.flipped_boxes[:second_part_size]],
+                        axis=0,
+                    ),
+                    np.concatenate(
+                        [
+                            self.affine_matrices[start_idx:],
+                            self.flipped_affine_matrices[:second_part_size],
+                        ],
+                        axis=0,
+                    ),
+                )
+            else:
+                # 从翻转视频到原始视频
+                return (
+                    np.concatenate(
+                        [
+                            self.flipped_video_frames[start_idx:],
+                            self.video_frames[:second_part_size],
+                        ],
+                        axis=0,
+                    ),
+                    torch.cat(
+                        [self.flipped_faces[start_idx:], self.faces[:second_part_size]],
+                        dim=0,
+                    ),
+                    np.concatenate(
+                        [self.flipped_boxes[start_idx:], self.boxes[:second_part_size]],
+                        axis=0,
+                    ),
+                    np.concatenate(
+                        [
+                            self.flipped_affine_matrices[start_idx:],
+                            self.affine_matrices[:second_part_size],
+                        ],
+                        axis=0,
+                    ),
+                )
 
 
 class LipsyncPipeline(DiffusionPipeline):
@@ -411,12 +565,15 @@ class LipsyncPipeline(DiffusionPipeline):
         callback_steps: Optional[int] = 1,
         **kwargs,
     ):
+        start_time = time.time()
+
         is_train = self.denoising_unet.training
         self.denoising_unet.eval()
 
         check_ffmpeg_installed()
+        print(f"[初始化] 耗时: {time.time() - start_time:.2f}秒")
 
-        # 0. Define call parameters
+        preprocess_start = time.time()
         batch_size = 1
         device = self._execution_device
         mask_image = load_fixed_mask(height, mask_image_path)
@@ -446,21 +603,26 @@ class LipsyncPipeline(DiffusionPipeline):
         # 4. Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
+        feature_start = time.time()
         whisper_feature = self.audio_encoder.audio2feat(audio_path)
         whisper_chunks = self.audio_encoder.feature2chunks(
             feature_array=whisper_feature, fps=video_fps
         )
+        print(f"[音频特征提取] 耗时: {time.time() - feature_start:.2f}秒")
 
+        video_start = time.time()
         audio_samples = read_audio(audio_path)
-        video_frames = read_video(video_path, use_decord=False)
-
-        video_frames, faces, boxes, affine_matrices = self.loop_video(
-            whisper_chunks, video_frames
+        # video_frames = read_video(video_path, use_decord=False)
+        # video_frames, faces, boxes, affine_matrices = self.loop_video(
+        #     whisper_chunks, video_frames
+        # )
+        video_data = LipsyncData(
+            video_frames=read_video(video_path, use_decord=False),
+            image_processor=self.image_processor,
         )
+        print(f"[视频预处理] 耗时: {time.time() - video_start:.2f}秒")
 
-        synced_video_frames = []
-        masked_video_frames = []
-
+        latent_start = time.time()
         num_channels_latents = self.vae.config.latent_channels
 
         # Prepare latent variables
@@ -474,9 +636,16 @@ class LipsyncPipeline(DiffusionPipeline):
             device,
             generator,
         )
+        print(f"[潜变量准备] 耗时: {time.time() - latent_start:.2f}秒")
 
+        inference_start = time.time()
         num_inferences = math.ceil(len(whisper_chunks) / num_frames)
-        for i in tqdm.tqdm(range(num_inferences), desc="Doing inference..."):
+        synced_video_frames = []
+        masked_video_frames = []
+        for i in tqdm.tqdm(range(num_inferences), desc="执行推理..."):
+            batch_start = time.time()
+
+            denoising_start = time.time()
             if self.denoising_unet.add_audio_layer:
                 audio_embeds = torch.stack(
                     whisper_chunks[i * num_frames : (i + 1) * num_frames]
@@ -487,7 +656,23 @@ class LipsyncPipeline(DiffusionPipeline):
                     audio_embeds = torch.cat([null_audio_embeds, audio_embeds])
             else:
                 audio_embeds = None
-            inference_faces = faces[i * num_frames : (i + 1) * num_frames]
+            start_index = i * num_frames
+            remaining_frames = len(whisper_chunks) - start_index
+            # 如果剩余窗口长度小于num_frames，需要调整end_index
+            if remaining_frames < num_frames:
+                print(
+                    f"调整窗口大小：剩余帧数 {remaining_frames} 小于请求的 {num_frames} 帧"
+                )
+                num_frames = remaining_frames
+                end_index = start_index + remaining_frames
+            video_frames, inference_faces, boxes, affine_matrices = video_data.get_data(
+                start_index, num_frames
+            )
+            # self.video_frames[start_idx:end_idx],
+            #         self.faces[start_idx:end_idx],
+            #         self.boxes[start_idx:end_idx],
+            #         self.affine_matrices[start_idx:end_idx],
+            # inference_faces = faces[i * num_frames : (i + 1) * num_frames]
             latents = all_latents[:, :, i * num_frames : (i + 1) * num_frames]
             ref_pixel_values, masked_pixel_values, masks = (
                 self.image_processor.prepare_masks_and_masked_images(
@@ -522,6 +707,7 @@ class LipsyncPipeline(DiffusionPipeline):
             )
             with self.progress_bar(total=num_inference_steps) as progress_bar:
                 for j, t in enumerate(timesteps):
+                    step_start = time.time()
                     # expand the latents if we are doing classifier free guidance
                     denoising_unet_input = (
                         torch.cat([latents] * 2)
@@ -570,21 +756,46 @@ class LipsyncPipeline(DiffusionPipeline):
                         if callback is not None and j % callback_steps == 0:
                             callback(j, t, latents)
 
+                    if j == len(timesteps) - 1:
+                        print(
+                            f"    └─ [去噪步骤 {j+1}/{len(timesteps)}] 耗时: {time.time() - step_start:.2f}秒"
+                        )
+
+            print(f"  ├─ [批次去噪] 耗时: {time.time() - denoising_start:.2f}秒")
+            print(
+                f"  └─ [批次 {i+1}/{num_inferences}] 总耗时: {time.time() - batch_start:.2f}秒"
+            )
+
             # Recover the pixel values
             decoded_latents = self.decode_latents(latents)
             decoded_latents = self.paste_surrounding_pixels_back(
                 decoded_latents, ref_pixel_values, 1 - masks, device, weight_dtype
             )
-            synced_video_frames.append(decoded_latents)
+            synced_video_frames_tmp = self.restore_video(
+                decoded_latents, video_frames, boxes, affine_matrices
+            )
+            synced_video_frames.append(synced_video_frames_tmp)
             # masked_video_frames.append(masked_pixel_values)
 
-        synced_video_frames = self.restore_video(
-            torch.cat(synced_video_frames), video_frames, boxes, affine_matrices
-        )
+        print(f"[推理阶段] 总耗时: {time.time() - inference_start:.2f}秒")
+
+        # 在视频重建阶段开始前添加
+        restore_start = time.time()
+        # synced_video_frames = self.restore_video(
+        #     torch.cat(synced_video_frames), video_frames, boxes, affine_matrices
+        # )
         # masked_video_frames = self.restore_video(
         #     torch.cat(masked_video_frames), video_frames, boxes, affine_matrices
         # )
+        # 将synced_video_frames从列表转换为numpy数组
+        if len(synced_video_frames) > 1:
+            # 如果有多个批次，需要连接它们
+            synced_video_frames = np.concatenate(synced_video_frames, axis=0)
+        else:
+            # 如果只有一个批次，直接取第一个元素
+            synced_video_frames = synced_video_frames[0]
 
+        print(f"最终视频帧形状: {synced_video_frames.shape}")
         audio_samples_remain_length = int(
             synced_video_frames.shape[0] / video_fps * audio_sample_rate
         )
@@ -605,3 +816,11 @@ class LipsyncPipeline(DiffusionPipeline):
 
         command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, 'video.mp4')} -i {os.path.join(temp_dir, 'audio.wav')} -c:v libx264 -c:a aac -q:v 0 -q:a 0 {video_out_path}"
         subprocess.run(command, shell=True)
+
+        print(f"[视频重建] 耗时: {time.time() - restore_start:.2f}秒")
+
+        # 在最终输出阶段开始前添加
+        output_start = time.time()
+        print(f"[最终输出] 耗时: {time.time() - output_start:.2f}秒")
+
+        print(f"\n[总计] 处理完成，总耗时: {time.time() - start_time:.2f}秒")
